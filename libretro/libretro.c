@@ -31,8 +31,9 @@
 
 #ifdef HAVE_LIBNX
 #include <switch.h>
+Thread* thread = NULL;
 #endif
-
+#include <pthread.h>
 #include <glsm/glsmsym.h>
 
 #include "api/m64p_frontend.h"
@@ -186,16 +187,13 @@ uint32_t EnableFBEmulation = 0;
 uint32_t EnableFrameDuping = 0;
 uint32_t EnableNoiseEmulation = 0;
 uint32_t EnableLODEmulation = 0;
-uint32_t EnableFullspeed = 0;
-uint32_t CountPerOp = 0;
-uint32_t CountPerScanlineOverride = 0;
 uint32_t BackgroundMode = 0; // 0 is bgOnePiece
 uint32_t EnableEnhancedTextureStorage;
 uint32_t EnableEnhancedHighResStorage;
 uint32_t EnableTxCacheCompression = 0;
-uint32_t ForceDisableExtraMem = 0;
 uint32_t EnableNativeResFactor = 0;
 uint32_t EnableN64DepthCompare = 0;
+uint32_t EnableThreadedRenderer = 0;
 
 // Overscan options
 #define GLN64_OVERSCAN_SCALING "0|1|2|3|4|5|6|7|8|9|10|11|12|13|14|15|16|17|18|19|20|21|22|23|24|25|26|27|28|29|30|31|32|33|34|35|36|37|38|39|40|41|42|43|44|45|46|47|48|49|50"
@@ -205,9 +203,17 @@ uint32_t OverscanLeft = 0;
 uint32_t OverscanRight = 0;
 uint32_t OverscanBottom = 0;
 
+uint32_t EnableFullspeed = 0;
+uint32_t CountPerOp = 0;
+uint32_t CountPerScanlineOverride = 0;
+uint32_t ForceDisableExtraMem = 0;
+
 extern struct device g_dev;
 extern unsigned int r4300_emumode;
 extern struct cheat_ctx g_cheat_ctx;
+
+static bool emuThreadRunning = false;
+static pthread_t emuThread;
 
 // after the controller's CONTROL* member has been assigned we can update
 // them straight from here...
@@ -250,6 +256,8 @@ static void setup_variables(void)
             "(GLN64) 16:9 Resolution; 960x540|640x360|1280x720|1920x1080|2560x1440|3840x2160|4096x2160|7680x4320" },
         { CORE_NAME "-aspect",
             "(GLN64) Aspect Ratio; 4:3|16:9|16:9 adjusted" },
+        { CORE_NAME "-ThreadedRenderer",
+            "(GLN64) Threaded GL Rendering; False|True" },
         { CORE_NAME "-BilinearMode",
             "(GLN64) Bilinear filtering mode; standard|3point" },
 #ifndef HAVE_OPENGLES2
@@ -456,12 +464,28 @@ static void emu_step_initialize(void)
     plugin_connect_all();
 }
 
-static void EmuThreadFunction(void)
+#ifdef HAVE_LIBNX
+#define EMUTHREAD_RET_TYPE void
+#else
+#define EMUTHREAD_RET_TYPE void*
+#endif
+static EMUTHREAD_RET_TYPE EmuThreadFunction(void* param)
 {
     log_cb(RETRO_LOG_DEBUG, CORE_NAME ": [EmuThread] M64CMD_EXECUTE\n");
 
     initializing = false;
+
+    // Runs until CMD_STOP
     CoreDoCommand(M64CMD_EXECUTE, 0, NULL);
+
+    if(current_rdp_type == RDP_PLUGIN_GLIDEN64 && EnableThreadedRenderer)
+    {
+        // Unset
+        emuThreadRunning = false;
+#ifdef HAVE_LIBNX
+        threadExit();
+#endif
+    }
 }
 
 void reinit_gfx_plugin(void)
@@ -624,16 +648,23 @@ void retro_init(void)
 
     environ_cb(RETRO_ENVIRONMENT_SET_PIXEL_FORMAT, &colorMode);
     environ_cb(RETRO_ENVIRONMENT_GET_RUMBLE_INTERFACE, &rumble);
-    initializing = true;
+    if(!(current_rdp_type == RDP_PLUGIN_GLIDEN64 && EnableThreadedRenderer))
+    {
+        initializing = true;
 
-    retro_thread = co_active();
-    game_thread = co_create(65536 * sizeof(void*) * 16, EmuThreadFunction);
+        retro_thread = co_active();
+        game_thread = co_create(65536 * sizeof(void*) * 16, EmuThreadFunction);
+    }
 }
 
 void retro_deinit(void)
-{
-    CoreDoCommand(M64CMD_STOP, 0, NULL);
-    co_switch(game_thread); /* Let the core thread finish */
+{    
+    if(!(current_rdp_type == RDP_PLUGIN_GLIDEN64 && EnableThreadedRenderer))
+    {
+        CoreDoCommand(M64CMD_STOP, 0, NULL);
+        co_switch(game_thread); /* Let the core thread finish */
+    }
+
     deinit_audio_libretro();
 
     if (perf_cb.perf_log)
@@ -782,6 +813,13 @@ static void update_variables(bool startup)
              plugin_connect_rsp_api(RSP_PLUGIN_HLE);
 #endif 
           }
+       }
+
+       var.key = CORE_NAME "-ThreadedRenderer";
+       var.value = NULL;
+       if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var) && var.value)
+       {
+          EnableThreadedRenderer = !strcmp(var.value, "True") ? 1 : 0;
        }
 
        var.key = CORE_NAME "-BilinearMode";
@@ -1372,7 +1410,7 @@ static void format_saved_memory(void)
     format_mempak(saved_memory.mempack + 3 * MEMPAK_SIZE);
 }
 
-static void context_reset(void)
+void context_reset(void)
 {
     static bool first_init = true;
 
@@ -1434,6 +1472,13 @@ bool retro_load_game(const struct retro_game_info *game)
     update_variables(true);
     initial_boot = false;
 
+    if(current_rdp_type == RDP_PLUGIN_GLIDEN64 && EnableThreadedRenderer)
+    {
+       initializing = true;
+       retro_thread = co_active();
+       game_thread = co_create(65536 * sizeof(void*) * 16, gln64_thr_gl_invoke_command_loop);
+    }
+
     init_audio_libretro(audio_buffer_size);
 
     params.context_reset         = context_reset;
@@ -1475,6 +1520,29 @@ bool retro_load_game(const struct retro_game_info *game)
 void retro_unload_game(void)
 {
     CoreDoCommand(M64CMD_ROM_CLOSE, 0, NULL);
+
+    if(current_rdp_type == RDP_PLUGIN_GLIDEN64 && EnableThreadedRenderer)
+    {
+       CoreDoCommand(M64CMD_STOP, 0, NULL);
+
+       // Run one more frame to unlock it
+       glsm_ctl(GLSM_CTL_STATE_BIND, NULL);
+       while(!threaded_gl_safe_shutdown)
+       {
+          co_switch(game_thread);
+       }
+       glsm_ctl(GLSM_CTL_STATE_UNBIND, NULL);
+    
+#ifndef HAVE_LIBNX
+       pthread_join(emuThread, NULL);
+#else
+       threadWaitForExit(thread);
+       threadClose(thread);
+       free(thread);
+       thread = NULL;
+#endif
+    }
+
     emu_initialized = false;
 }
 
@@ -1490,6 +1558,23 @@ void retro_run (void)
 
     if(current_rdp_type == RDP_PLUGIN_GLIDEN64)
     {
+       if(EnableThreadedRenderer)
+       {
+          if(!emuThreadRunning)
+          {
+#ifndef HAVE_LIBNX
+             pthread_create(&emuThread, NULL, &EmuThreadFunction, NULL);
+#else
+             thread = (Thread*)malloc(sizeof(Thread));
+             u32 thread_priority = 0;
+             svcGetThreadPriority(&thread_priority, CUR_THREAD_HANDLE);
+             threadCreate(thread, EmuThreadFunction, NULL, NULL, 1024 * 1024 * 12, thread_priority - 1, 2);
+             threadStart(thread);
+#endif
+             emuThreadRunning = true;
+          }
+       }
+       
        glsm_ctl(GLSM_CTL_STATE_BIND, NULL);
     }
 
@@ -1518,7 +1603,12 @@ void retro_run (void)
         // screen_pitch will be 0 for GLN
         video_cb(NULL, retro_screen_width, retro_screen_height, screen_pitch);
     }
-        
+
+    // Poll needs to happen here on threaded gl
+    if(current_rdp_type == RDP_PLUGIN_GLIDEN64 && EnableThreadedRenderer)
+    {
+       poll_cb();
+    }
 }
 
 void retro_reset (void)
@@ -1655,7 +1745,10 @@ void retro_cheat_set(unsigned index, bool enabled, const char* codeLine)
 
 void retro_return(void)
 {
-    co_switch(retro_thread);
+    if(!(current_rdp_type == RDP_PLUGIN_GLIDEN64 && EnableThreadedRenderer))
+    {
+       co_switch(retro_thread);
+    }
 }
 
 uint32_t get_retro_screen_width()
