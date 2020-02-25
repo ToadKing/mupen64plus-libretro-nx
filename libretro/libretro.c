@@ -395,7 +395,7 @@ static void setup_variables(void)
         { CORE_NAME "-pak4",
            "Player 4 Pak; none|memory|rumble"},
         { CORE_NAME "-CountPerOp",
-            "Count Per Op; 0|1|2|3" },
+            "Count Per Op; 0|1|2|3|4|5" },
         { NULL, NULL },
     };
 
