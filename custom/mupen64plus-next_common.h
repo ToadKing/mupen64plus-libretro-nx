@@ -66,7 +66,7 @@ extern char* retro_dd_path_img;
 extern char* retro_dd_path_rom;
 
 // Threaded GL Callback
-extern void gln64_thr_gl_invoke_command_loop();
+extern void gln64_thr_gl_invoke_command_loop(void);
 extern bool threaded_gl_safe_shutdown;
 
 // Core options

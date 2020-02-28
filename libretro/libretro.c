@@ -464,12 +464,11 @@ static void emu_step_initialize(void)
     plugin_connect_all();
 }
 
-#ifdef HAVE_LIBNX
-#define EMUTHREAD_RET_TYPE void
+#if defined(HAVE_LIBNX)
+static void EmuThreadFunction(void* param)
 #else
-#define EMUTHREAD_RET_TYPE void*
+static void EmuThreadFunction(void)
 #endif
-static EMUTHREAD_RET_TYPE EmuThreadFunction(void* param)
 {
     log_cb(RETRO_LOG_DEBUG, CORE_NAME ": [EmuThread] M64CMD_EXECUTE\n");
 
